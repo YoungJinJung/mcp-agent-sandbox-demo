@@ -37,7 +37,7 @@ sequenceDiagram
     P-->>C: stdout / stderr / exit_code via MCP server
     C->>M: download_file(result.json)
     C->>M: delete_sandbox
-    M->>K: Delete claim; controller cleans up sandbox
+    M->>K: Delete claim, controller cleans up sandbox
 ```
 
 MCP는 **도구 호출을 주고받는 프로토콜**입니다. 샌드박스의 생성·준비·삭제는 Kubernetes의
