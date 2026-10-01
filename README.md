@@ -103,6 +103,79 @@ Dockerfile이나 의존성을 변경한 뒤에는 `make down` 후 `make up`으�
 PASS: MCP round trip completed; no demo claims remain.
 ```
 
+## Floci로 로컬 EKS 실습하기
+
+[Floci](https://github.com/floci-io/floci)의 **real EKS 모드**도 지원합니다.
+AWS CLI의 EKS API로 클러스터를 생성하면 Floci가 Docker 안에 실제 k3s를 띄웁니다.
+AWS 관리형 EKS 자체를 실행하는 것은 아니며, AWS 계정이나 클라우드 요금은 필요하지 않습니다.
+EKS API·인증 흐름과 Kubernetes 워크로드를 함께 실습하는 로컬 환경입니다.
+
+기존 준비물 중 kind 대신 **AWS CLI v2와 Docker Compose v2**가 필요합니다.
+macOS에서는 `brew install awscli`로 AWS CLI를 설치할 수 있습니다.
+
+```bash
+make floci-up      # Floci → EKS API → k3s → agent-sandbox/MCP 배포
+make floci-demo    # 기존 MCP 왕복 검증
+make floci-ci      # CI 실패 재현 → 미리 정의한 패치 → 같은 테스트로 검증
+make floci-status
+```
+
+스크립트는 AWS CLI 요청을 `http://127.0.0.1:14566`에만 보내며 기존 AWS 인증 환경변수를
+제거합니다. Floci 안에서 만든 실습용 IAM 키와 전용 kubeconfig는 git에서 제외된
+`.state/floci/`에 저장합니다. 기본 AWS 프로필과 기본 kubeconfig는 변경하지 않습니다.
+`aws eks update-kubeconfig`와 `aws eks get-token` 인증을 거쳐 실제 Kubernetes API에 연결합니다.
+
+| 주소/파일 | 용도 |
+|---|---|
+| `127.0.0.1:14566` | Floci의 AWS API |
+| `https://localhost:16650` | Floci가 생성한 k3s Kubernetes API |
+| `127.0.0.1:18000` | 데모 실행 중에만 열리는 MCP 포트포워딩 |
+| `.state/floci/kubeconfig` | `floci-mcp-agent-sandbox-demo` 전용 컨텍스트 |
+| `.state/floci/ci-report.json` | 테스트 전후 stdout, stderr, 종료 코드와 패치 |
+
+Floci는 Docker 소켓을 사용하고 privileged k3s 컨테이너를 생성합니다. 이 버전은 k3s API
+포트를 Docker의 모든 인터페이스에 게시하므로, 공유 서버나 외부에 노출된 호스트 대신
+신뢰할 수 있는 로컬 Docker 환경에서 실행하세요. AWS의 VPC, IAM 권한 경계, 관리형 노드 그룹,
+로드밸런서 동작과의 동일성은 이 실습에서 검증하지 않습니다.
+
+상태와 로그를 직접 확인하려면:
+
+```bash
+kubectl --kubeconfig .state/floci/kubeconfig --context floci-mcp-agent-sandbox-demo get nodes
+kubectl --kubeconfig .state/floci/kubeconfig --context floci-mcp-agent-sandbox-demo \
+  -n mcp-demo logs deployment/mcp-server
+docker logs mcp-demo-floci
+```
+
+종료할 때는 `make floci-down`을 실행합니다. 전용 EKS 클러스터를 먼저 삭제한 뒤 Floci와
+저장 볼륨, 로컬 실습 키·kubeconfig를 정리합니다. 로그와 CI 리포트는 남깁니다.
+kind 실습은 별개이며 `make down`으로 정리합니다. 두 데모는 포트 18000을 공유하므로
+`make demo`와 `make floci-demo`/`make floci-ci`를 동시에 실행하지 마세요.
+
+### DevTools: CI 실패 재현과 패치 검증
+
+첫 실습은 **배포 시 요청한 replica 수가 준비되었는지 판단하는 코드**입니다.
+[rollout.py](devtools/sample/rollout.py)에는 의도적인 버그가 있습니다.
+3개를 요청했는데 1개만 준비돼도 성공으로 판단합니다.
+
+`make floci-ci`는 [ci_demo.py](devtools/ci_demo.py)를 실행해 다음을 확인합니다.
+
+1. MCP로 새 SandboxClaim을 만들고 소스와 회귀 테스트를 업로드합니다.
+2. Pod 안에서 `python -B -m unittest -v test_rollout`을 실행하고, 예상한 assertion 실패와 종료 코드 1을 확인합니다.
+3. `available > 0`을 `available >= desired`로 바꾸는 미리 정의한 패치를 업로드합니다.
+4. **테스트를 수정하지 않고** 같은 명령을 재실행해 종료 코드 0을 확인합니다.
+5. 전후 로그와 diff를 JSON 리포트에 저장하고 claim을 삭제합니다.
+
+```text
+before: exit_code=1
+after: exit_code=0
+PASS: failure reproduced; predefined patch passes the unchanged test
+```
+
+이 단계는 LLM의 자동 진단·수정이나 임의의 GitHub Actions 작업 재현을 구현하지 않습니다.
+실제 Deployment의 전체 readiness 판정도 아닙니다. 외부 도구가 제안한 수정안을
+별도 Pod에서 실행하고 증거를 수집하는 DevTools의 최소 실행 경로를 보여줍니다.
+
 ## 코드 따라가기
 
 실습의 핵심은 [demo.py](demo.py)에 있습니다.
@@ -200,6 +273,8 @@ MCP 서버와 런타임 HTTP API에는 인증이 없습니다. MCP 서버의 Ser
 | FastMCP | `3.4.4` |
 | 컨테이너 Python | `3.12-slim` — Dockerfile에서 이미지 digest 고정 |
 | kind 노드 | Kubernetes `v1.35.8` — 노드 이미지 digest 고정 |
+| Floci | `2.1.0` — Compose에서 이미지 digest 고정 |
+| Floci EKS 노드 | k3s `v1.35.8-k3s1` — Compose에서 이미지 digest 고정 |
 
 Python 의존성은 [requirements.lock](requirements.lock)에 버전과 해시를 고정했습니다.
 업데이트할 때는 [requirements.in](requirements.in)을 변경하고 다음 명령으로 다시 생성한 뒤
@@ -214,5 +289,6 @@ uv pip compile --universal --python-version 3.12 --generate-hashes --no-annotate
 - [Upstream Python 런타임](https://github.com/kubernetes-sigs/agent-sandbox/blob/87a4695e620f6057fef3f6b0c0251f2986b1c36f/examples/python-runtime-sandbox/main.py)
 - [MCP 공식 문서](https://modelcontextprotocol.io/docs/getting-started/intro)
 - [FastMCP 클라이언트](https://gofastmcp.com/clients/client)
+- [Floci 2.1.0 EKS 문서](https://github.com/floci-io/floci/blob/2.1.0/docs/services/eks.md)
 
 Apache-2.0 라이선스입니다. 재사용하는 upstream 소스의 저작권 헤더와 라이선스를 이미지에 보존합니다.
